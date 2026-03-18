@@ -155,7 +155,7 @@ class IdeaExecutor:
         output_dir=".",
         analysis_name="analysis",
         max_iterations=6,
-        max_fix_attempts=3,
+        max_fix_attempts=5,
         use_self_critique=True,
         use_VLM=True,
         use_documentation=True,

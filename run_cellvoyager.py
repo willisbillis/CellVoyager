@@ -31,15 +31,21 @@ def main():
     # Execution module selection
     parser.add_argument(
         "--execution-mode",
-        choices=["legacy", "claude"],
+        choices=["legacy", "claude", "ollama"],
         default="claude",
-        help="Execution module: 'legacy' = IdeaExecutor (programmatic kernel), "
-        "'claude' = ClaudeJupyterExecutor (live Jupyter + Claude Agent SDK) (default: legacy)",
+        help="Execution module: 'legacy' = IdeaExecutor (programmatic kernel via LiteLLM), "
+        "'claude' = ClaudeJupyterExecutor (live Jupyter + Claude Agent SDK), "
+        "'ollama' = IdeaExecutor routed through a local Ollama server (default: claude)",
     )
     parser.add_argument(
         "--anthropic-api-key",
         default=None,
         help="Anthropic API key for Claude execution mode (or set ANTHROPIC_API_KEY env)",
+    )
+    parser.add_argument(
+        "--ollama-base-url",
+        default="http://localhost:11434",
+        help="Ollama server URL when using --execution-mode ollama (default: http://localhost:11434)",
     )
 
     # Jupyter options (for execution_mode=claude)
@@ -68,8 +74,10 @@ def main():
     # Optional arguments with defaults
     parser.add_argument(
         "--model-name",
-        default="claude-sonnet-4-6",
-        help="LLM model for hypothesis generation — any OpenAI or Anthropic model (e.g. o3-mini, gpt-4o, claude-sonnet-4-5). Default: o3-mini",
+        default=None,
+        help="LLM model for hypothesis generation — any LiteLLM-supported model "
+        "(e.g. claude-sonnet-4-5, gpt-4o, ollama/llama3.1). "
+        "Default: claude-sonnet-4-6 (cloud) or ollama/llama3.1 (ollama mode)",
     )
     parser.add_argument(
         "--execution-model",
@@ -120,6 +128,11 @@ def main():
         "--no-self-critique",
         action="store_true",
         help="Disable self-critique functionality",
+    )
+    parser.add_argument(
+        "--self-critique",
+        action="store_true",
+        help="Force-enable self-critique (overrides auto-disable for Ollama)",
     )
     parser.add_argument(
         "--no-vlm",
@@ -178,12 +191,30 @@ def main():
 
     args = parser.parse_args()
 
-    # Check if OpenAI API key is available
+    # Default model name based on execution mode
+    if args.model_name is None:
+        if args.execution_mode == "ollama":
+            args.model_name = "ollama/llama3.1"
+        else:
+            args.model_name = "claude-sonnet-4-6"
+
+    # Ollama mode: VLM off by default (most local models lack vision)
+    if args.execution_mode == "ollama" and not args.no_vlm:
+        args.no_vlm = True
+
+    # Check if OpenAI API key is available (not required for ollama mode)
     openai_api_key = os.getenv("OPENAI_API_KEY")
-    if not openai_api_key:
+    if not openai_api_key and args.execution_mode != "ollama":
         print("❌ Error: OPENAI_API_KEY environment variable not set")
         print("Please set your OpenAI API key: export OPENAI_API_KEY='your-key-here'")
+        print("Tip: Use --execution-mode ollama to run entirely locally without API keys.")
         return 1
+
+    # Determine self-critique setting early (used by both resume and normal paths).
+    # Auto-disable for Ollama unless explicitly forced on.
+    _use_self_critique = not args.no_self_critique
+    if args.execution_mode == "ollama" and not args.self_critique and not args.no_self_critique:
+        _use_self_critique = False
 
     # Resume mode: handle separately before normal validation
     if args.resume:
@@ -231,7 +262,7 @@ def main():
             output_home=args.output_home,
             output_dir=str(out_dir),
             log_home=args.log_home,
-            use_self_critique=not args.no_self_critique,
+            use_self_critique=_use_self_critique,
             use_VLM=not args.no_vlm,
             use_documentation=not args.no_documentation,
             log_prompts=args.log_prompts,
@@ -277,13 +308,19 @@ def main():
     print(f"   Number of analyses: {args.num_analyses}")
     print(f"   Max iterations: {args.max_iterations}")
     print(f"   Execution mode: {args.execution_mode}")
-    print(f"   Self-critique: {'❌' if args.no_self_critique else '✅'}")
+    print(f"   Self-critique: {'✅' if _use_self_critique else '❌'}")
     print(f"   VLM: {'❌' if args.no_vlm else '✅'}")
     print(f"   Documentation: {'❌' if args.no_documentation else '✅'}")
     if args.execution_mode == "claude":
         print(f"   Jupyter port: {args.jupyter_port}")
         print(f"   Auto-start Jupyter: {'❌' if args.no_auto_start_jupyter else '✅'}")
         print(f"   Interactive mode: {'✅' if args.interactive else '❌'}")
+    if args.execution_mode == "ollama":
+        print(f"   Ollama base URL: {args.ollama_base_url}")
+
+    if not _use_self_critique and args.execution_mode == "ollama" and not args.no_self_critique:
+        print("⚠️  Self-critique auto-disabled for Ollama mode (small models degrade analysis during critique).")
+        print("   Re-enable with --self-critique if using a large model (>13B).")
     print()
 
     # Execution kwargs for Claude mode
@@ -298,6 +335,10 @@ def main():
             "intervene_every": args.intervene_every,
             "execution_model": args.execution_model,
         }
+    elif args.execution_mode == "ollama":
+        execution_kwargs = {
+            "ollama_base_url": args.ollama_base_url,
+        }
 
     agent = AnalysisAgentV2(
         h5ad_path=args.h5ad_path,
@@ -311,12 +352,12 @@ def main():
         output_home=args.output_home,
         output_dir=args.output_dir,
         log_home=args.log_home,
-        use_self_critique=not args.no_self_critique,
+        use_self_critique=_use_self_critique,
         use_VLM=not args.no_vlm,
         use_documentation=not args.no_documentation,
         log_prompts=args.log_prompts,
         max_fix_attempts=args.max_fix_attempts,
-        use_deepresearch_background=args.deepresearch,
+        use_deepresearch_background=args.deepresearch if args.execution_mode != "ollama" else False,
         execution_mode=args.execution_mode,
         anthropic_api_key=args.anthropic_api_key or os.getenv("ANTHROPIC_API_KEY"),
         **execution_kwargs,

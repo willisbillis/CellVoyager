@@ -7,12 +7,126 @@ import re
 import json
 import base64
 import datetime
+import litellm
 import nbformat as nbf
 from nbformat.v4 import new_code_cell, new_output
 from jupyter_client import KernelManager
 from cellvoyager.utils import get_documentation
+from cellvoyager.hypothesis import _normalize_model_name
 
 AVAILABLE_PACKAGES = "scanpy, scvi, anndata, matplotlib, numpy, seaborn, pandas, scipy"
+
+# Schema hint appended to prompts when using local models that need extra guidance
+_JSON_SCHEMA_HINT = (
+    "\n\n--- REQUIRED OUTPUT FORMAT ---\n"
+    "You MUST respond with ONLY a valid JSON object with these exact keys:\n"
+    "{\n"
+    '  "hypothesis": "<string: your scientific hypothesis>",\n'
+    '  "analysis_plan": ["<string: step 1>", "<string: step 2>"],\n'
+    '  "first_step_code": "<string: complete Python code for the next step>",\n'
+    '  "code_description": "<string: 1-2 sentences describing the code>",\n'
+    '  "summary": "<string: 1-2 sentence overall summary>"\n'
+    "}\n"
+    "ALL FIVE fields are REQUIRED. Do NOT include any text outside the JSON object.\n"
+)
+
+
+def _extract_json_object(raw_text: str) -> dict | None:
+    """Best-effort extraction of a JSON object from raw LLM text."""
+    text = raw_text.strip()
+    # Strip markdown code fences (with or without language tag)
+    if "```" in text:
+        # Extract content between ``` markers
+        fence_pattern = re.compile(r"```(?:json)?\s*\n?(.*?)```", re.DOTALL)
+        for m in fence_pattern.finditer(text):
+            candidate = m.group(1).strip()
+            if candidate.startswith("{"):
+                text = candidate
+                break
+        else:
+            # Fallback: split approach for unclosed fences (truncated response)
+            for block in text.split("```"):
+                candidate = block.strip()
+                if candidate.startswith("json"):
+                    candidate = candidate[4:].strip()
+                if candidate.startswith("{"):
+                    text = candidate
+                    break
+    # Direct parse
+    try:
+        data = json.loads(text)
+        if isinstance(data, dict):
+            return data
+    except json.JSONDecodeError:
+        pass
+    # Find outermost braces
+    start = text.find("{")
+    end = text.rfind("}")
+    if start != -1 and end > start:
+        try:
+            data = json.loads(text[start : end + 1])
+            if isinstance(data, dict):
+                return data
+        except json.JSONDecodeError:
+            pass
+    # Try to repair truncated JSON (model ran out of tokens)
+    if start != -1:
+        fragment = text[start:]
+        repaired = _repair_truncated_json(fragment)
+        if repaired is not None:
+            return repaired
+    return None
+
+
+def _repair_truncated_json(fragment: str) -> dict | None:
+    """Attempt to repair a truncated JSON object by closing open brackets/braces."""
+    # Count unmatched brackets
+    in_string = False
+    escape = False
+    open_braces = 0
+    open_brackets = 0
+    for ch in fragment:
+        if escape:
+            escape = False
+            continue
+        if ch == '\\':
+            if in_string:
+                escape = True
+            continue
+        if ch == '"' and not escape:
+            in_string = not in_string
+            continue
+        if in_string:
+            continue
+        if ch == '{':
+            open_braces += 1
+        elif ch == '}':
+            open_braces -= 1
+        elif ch == '[':
+            open_brackets += 1
+        elif ch == ']':
+            open_brackets -= 1
+    if open_braces <= 0:
+        return None  # not truncated or unparseable
+    # Strip trailing incomplete string/value
+    # Find last complete key-value pair by looking for last comma or colon
+    trimmed = fragment.rstrip()
+    # Remove trailing incomplete token
+    for end_char in (',', '"', ':'):
+        idx = trimmed.rfind(end_char)
+        if idx > 0:
+            candidate = trimmed[:idx]
+            # Ensure strings are closed
+            if candidate.count('"') % 2 != 0:
+                candidate += '"'
+            suffix = ']' * max(open_brackets, 0) + '}' * max(open_braces, 0)
+            try:
+                data = json.loads(candidate + suffix)
+                if isinstance(data, dict):
+                    return data
+            except json.JSONDecodeError:
+                continue
+    return None
 
 
 def strip_code_markers(text):
@@ -29,17 +143,17 @@ class IdeaExecutor:
     def __init__(
         self,
         hypothesis_generator,
-        client,
-        model_name,
-        prompt_dir,
-        coding_guidelines,
-        coding_system_prompt,
-        adata_summary,
-        paper_summary,
-        logger,
-        h5ad_path,
-        output_dir,
-        analysis_name,
+        client=None,
+        model_name="gpt-4o",
+        prompt_dir=None,
+        coding_guidelines="",
+        coding_system_prompt="",
+        adata_summary="",
+        paper_summary="",
+        logger=None,
+        h5ad_path="",
+        output_dir=".",
+        analysis_name="analysis",
         max_iterations=6,
         max_fix_attempts=3,
         use_self_critique=True,
@@ -47,8 +161,8 @@ class IdeaExecutor:
         use_documentation=True,
     ):
         self.hypothesis_generator = hypothesis_generator
-        self.client = client
-        self.model_name = model_name
+        self.client = client  # kept for backward compat; unused after LiteLLM migration
+        self.model_name = _normalize_model_name(model_name)
         self.prompt_dir = prompt_dir
         self.coding_guidelines = coding_guidelines
         self.coding_system_prompt = coding_system_prompt
@@ -129,32 +243,46 @@ class IdeaExecutor:
                 num_steps_left=num_steps_left,
             )
 
+        is_ollama = self.model_name.startswith("ollama")
+
+        # For local models, reinforce the JSON schema
+        if is_ollama:
+            prompt += _JSON_SCHEMA_HINT
+
         # Retry logic for generating valid analysis plan
-        max_retries = 2
+        max_retries = 4 if is_ollama else 2
         for attempt in range(max_retries + 1):
             try:
-                response = self.client.chat.completions.create(
+                kwargs = dict(
                     model=self.model_name,
                     messages=[
                         {"role": "system", "content": self.coding_system_prompt},
                         {"role": "user", "content": prompt},
                     ],
-                    response_format={"type": "json_object"},
                 )
+                # response_format not reliably supported by all Ollama models
+                if not is_ollama:
+                    kwargs["response_format"] = {"type": "json_object"}
+                response = litellm.completion(**kwargs)
                 result = response.choices[0].message.content
 
                 if result is None:
                     print(f"⚠️ API returned None response in generate_next_step (attempt {attempt + 1})")
                     if attempt == max_retries:
-                        raise ValueError("OpenAI API returned None response for next step after all retries")
+                        raise ValueError("API returned None response for next step after all retries")
                     continue
 
+                # Try structured JSON parse first, then fallback extraction
+                analysis = None
                 try:
                     analysis = json.loads(result)
-                except json.JSONDecodeError as e:
-                    print(f"⚠️ JSON decode error in generate_next_step (attempt {attempt + 1}): {e}")
+                except json.JSONDecodeError:
+                    analysis = _extract_json_object(result)
+
+                if analysis is None:
+                    print(f"⚠️ JSON decode error in generate_next_step (attempt {attempt + 1})")
                     if attempt == max_retries:
-                        raise
+                        raise ValueError(f"Could not parse JSON from response: {result[:300]}")
                     continue
 
                 if "analysis_plan" not in analysis:
@@ -233,7 +361,11 @@ class IdeaExecutor:
         Error:
         {truncated_error}
 
-        Provide only the fixed code with no explanation.
+        IMPORTANT: The dataset is an AnnData .h5ad file located at: {self.h5ad_path}
+        It should be loaded with: adata = sc.read_h5ad("{self.h5ad_path}")
+        The variable `adata` is already loaded in the kernel. Do NOT load data from CSV or other files.
+
+        Provide only the fixed Python code with no explanation.
         You can only use the following packages: {AVAILABLE_PACKAGES}
 
         Here is previous code/context (if any):
@@ -252,16 +384,36 @@ class IdeaExecutor:
         if estimated_tokens > 50000:
             print(f"⚠️ Warning: Large fix_code prompt detected ({estimated_tokens} estimated tokens)")
 
-        response = self.client.chat.completions.create(
+        response = litellm.completion(
             model=self.model_name,
             messages=[
-                {"role": "system", "content": "You are a coding assistant helping to fix code."},
+                {"role": "system", "content": "You are a coding assistant helping to fix code. Return ONLY the fixed Python code, nothing else."},
                 {"role": "user", "content": prompt},
             ],
         )
         fixed_code = response.choices[0].message.content
 
+        # Extract just the code — local models often wrap in markdown or add explanations
+        fixed_code = self._extract_code(fixed_code)
+
         return fixed_code
+
+    @staticmethod
+    def _extract_code(text: str) -> str:
+        """Extract Python code from a response that may contain markdown fences or explanation."""
+        if text is None:
+            return ""
+        text = text.strip()
+        # If there's a ```python block, extract its contents
+        m = re.search(r"```(?:python)?\s*\n(.*?)```", text, re.DOTALL)
+        if m:
+            return m.group(1).strip()
+        # If the whole response looks like code (starts with import/from/def/class/#), use it as-is
+        first_line = text.split("\n")[0].strip()
+        if first_line.startswith(("import ", "from ", "def ", "class ", "#", "adata", "sc.", "plt.", "np.", "pd.")):
+            return text
+        # Last resort: strip any remaining ``` markers
+        return re.sub(r"```python|```", "", text).strip()
 
     def generate_code_description(self, code, context=""):
         """Generate a description for a code cell based on its content"""
@@ -273,7 +425,7 @@ class IdeaExecutor:
         ```
         """
 
-        response = self.client.chat.completions.create(
+        response = litellm.completion(
             model=self.model_name,
             messages=[
                 {
@@ -346,8 +498,8 @@ class IdeaExecutor:
                         print(f"Warning: Error processing image: {str(e)}")
                         continue
 
-                response = self.client.chat.completions.create(
-                    model="gpt-4o",
+                response = litellm.completion(
+                    model=self.model_name,
                     messages=[
                         {
                             "role": "system",
@@ -363,7 +515,7 @@ class IdeaExecutor:
                 import gc
                 gc.collect()
         else:
-            response = self.client.chat.completions.create(
+            response = litellm.completion(
                 model=self.model_name,
                 messages=[
                     {

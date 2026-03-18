@@ -604,7 +604,7 @@ with st.sidebar:
 
 # Main: running / pause / notebook viewer
 # If run was started but process is dead (e.g. finished, or server restarted), transition to completed view
-if st.session_state.run_started and not g._has_live_run():
+if st.session_state.get("run_started", False) and not g._has_live_run():
     st.session_state.run_proc = None
     st.session_state.run_pid = None
     st.session_state.run_started = False
@@ -1012,7 +1012,7 @@ if st.session_state.get("run_started") and g._has_live_run():
 </script>""", height=0)
 
 # Interactive edit screen (when analysis was stopped — no agent, but full edit UI)
-elif st.session_state.run_output_dir and not st.session_state.run_started and st.session_state.get("run_show_interactive"):
+elif st.session_state.get("run_output_dir") and not st.session_state.get("run_started", False) and st.session_state.get("run_show_interactive"):
     request_path = g._pause_request_path()
     response_path = g._pause_response_path()
     nb_path = ""
@@ -1097,7 +1097,7 @@ elif st.session_state.run_output_dir and not st.session_state.run_started and st
             st.switch_page("app.py")
 
 # Notebook viewer (when analysis completed)
-elif st.session_state.run_output_dir and not st.session_state.run_started:
+elif st.session_state.get("run_output_dir") and not st.session_state.get("run_started", False):
     # Show restoring message while resume process is starting up
     _resume_restoring_main = st.session_state.get("_resume_restoring")
     if _resume_restoring_main and _resume_restoring_main[0] == st.session_state.run_output_dir:

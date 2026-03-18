@@ -2,10 +2,11 @@
 Hypothesis generation module.
 Extracted from agent.py - Phase 1: Idea Generation.
 """
+import json
 import os
 import instructor
 import litellm
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError
 from cellvoyager.utils import get_documentation
 
 litellm.drop_params = True  # ignore unsupported params per-model silently
@@ -13,6 +14,8 @@ litellm.drop_params = True  # ignore unsupported params per-model silently
 # Instructor client wrapping LiteLLM — handles retries, validation, and structured output
 # for all OpenAI and Anthropic models uniformly.
 _instructor_client = instructor.from_litellm(litellm.completion)
+# JSON-mode client for providers that lack function-calling / tools support (e.g. Ollama).
+_instructor_client_json = instructor.from_litellm(litellm.completion, mode=instructor.Mode.JSON)
 
 
 _MODEL_ALIASES = {
@@ -85,12 +88,128 @@ class HypothesisGenerator:
 
     def _complete_structured(self, messages: list) -> dict:
         """Call LiteLLM via instructor and return a validated AnalysisPlan dict."""
+        is_ollama = self.model_name.startswith("ollama")
+
+        if is_ollama:
+            return self._complete_structured_ollama(messages)
+
         result = _instructor_client.chat.completions.create(
             model=self.model_name,
             messages=list(messages),
             response_model=AnalysisPlan,
+            max_retries=3,
         )
         return result.model_dump()
+
+    # ------------------------------------------------------------------
+    # Ollama-specific structured output with reinforced schema prompting
+    # ------------------------------------------------------------------
+
+    _OLLAMA_SCHEMA_HINT = (
+        "\n\n--- REQUIRED OUTPUT FORMAT ---\n"
+        "You MUST respond with ONLY a valid JSON object with these exact keys:\n"
+        "{\n"
+        '  "hypothesis": "<string: your scientific hypothesis>",\n'
+        '  "analysis_plan": ["<string: step 1>", "<string: step 2>"],\n'
+        '  "first_step_code": "<string: complete Python code for the first step>",\n'
+        '  "code_description": "<string: 1-2 sentences describing the code>",\n'
+        '  "summary": "<string: 1-2 sentence overall summary>"\n'
+        "}\n"
+        "ALL FIVE fields are REQUIRED: hypothesis, analysis_plan, first_step_code, "
+        "code_description, summary.\n"
+        "Do NOT include any text outside the JSON object."
+    )
+
+    def _complete_structured_ollama(self, messages: list) -> dict:
+        """Structured output for Ollama models with schema reinforcement and fallback."""
+        messages = list(messages)
+
+        # Reinforce the expected JSON schema at the end of the last user message
+        for i in range(len(messages) - 1, -1, -1):
+            if messages[i]["role"] == "user":
+                messages[i] = {
+                    **messages[i],
+                    "content": messages[i]["content"] + self._OLLAMA_SCHEMA_HINT,
+                }
+                break
+
+        # Try instructor JSON-mode first (gives the model 5 chances)
+        try:
+            result = _instructor_client_json.chat.completions.create(
+                model=self.model_name,
+                messages=messages,
+                response_model=AnalysisPlan,
+                max_retries=5,
+            )
+            return result.model_dump()
+        except (ValidationError, Exception) as exc:
+            # Instructor exhausted retries — attempt manual extraction from the
+            # raw LLM response as a last resort.
+            print(f"⚠️ Instructor structured output failed, attempting manual extraction: {exc}")
+
+        raw_response = litellm.completion(model=self.model_name, messages=messages)
+        raw_text = raw_response.choices[0].message.content or ""
+        return self._extract_analysis_plan(raw_text)
+
+    @staticmethod
+    def _extract_analysis_plan(raw_text: str) -> dict:
+        """Best-effort extraction of AnalysisPlan fields from raw LLM text."""
+        import re as _re
+        text = raw_text.strip()
+
+        # Strip markdown code fences (with or without language tag)
+        if "```" in text:
+            fence_pat = _re.compile(r"```(?:json)?\s*\n?(.*?)```", _re.DOTALL)
+            for m in fence_pat.finditer(text):
+                candidate = m.group(1).strip()
+                if candidate.startswith("{"):
+                    text = candidate
+                    break
+            else:
+                # Unclosed fence (truncated) — split fallback
+                for block in text.split("```"):
+                    candidate = block.strip()
+                    if candidate.startswith("json"):
+                        candidate = candidate[4:].strip()
+                    if candidate.startswith("{"):
+                        text = candidate
+                        break
+
+        # Try direct JSON parse
+        try:
+            data = json.loads(text)
+            if isinstance(data, dict) and "hypothesis" in data:
+                return AnalysisPlan(**data).model_dump()
+        except (json.JSONDecodeError, ValidationError):
+            pass
+
+        # Brute-force: find the outermost { ... } in the text
+        start = text.find("{")
+        end = text.rfind("}")
+        if start != -1 and end > start:
+            try:
+                data = json.loads(text[start : end + 1])
+                if isinstance(data, dict) and "hypothesis" in data:
+                    return AnalysisPlan(**data).model_dump()
+            except (json.JSONDecodeError, ValidationError):
+                pass
+
+        # Try repairing truncated JSON (model ran out of tokens)
+        if start != -1:
+            from cellvoyager.execution.legacy import _repair_truncated_json
+            repaired = _repair_truncated_json(text[start:])
+            if repaired is not None and "hypothesis" in repaired:
+                try:
+                    return AnalysisPlan(**repaired).model_dump()
+                except ValidationError:
+                    pass
+
+        raise ValueError(
+            "Could not extract a valid AnalysisPlan from the model response. "
+            "The local model may be too small for this task — try a larger model "
+            "like ollama/llama3.1 (8B) or ollama/qwen2.5-coder (7B).\n"
+            f"Raw response (first 500 chars): {raw_text[:500]}"
+        )
 
     def _complete(self, messages: list) -> str:
         """Call LiteLLM for plain-text responses (e.g. critique feedback)."""
@@ -198,6 +317,18 @@ class HypothesisGenerator:
             num_steps_left=num_steps_left,
         )
 
+        # For Ollama models: reinforce constraints so the critique doesn't hallucinate
+        if self.model_name.startswith("ollama"):
+            prompt += (
+                "\n\nCRITICAL CONSTRAINTS:\n"
+                "- Keep the hypothesis closely related to the ORIGINAL hypothesis above.\n"
+                "- The data is in AnnData (.h5ad) format — load with sc.read_h5ad(). "
+                "Do NOT use read_csv, read_cellranger, or any other data loading method.\n"
+                "- Only use these packages: scanpy, scvi, anndata, matplotlib, numpy, "
+                "seaborn, pandas, scipy. Do NOT import any other packages.\n"
+                "- The variable `adata` is already loaded in the kernel.\n"
+            )
+
         if self.log_prompts:
             self.logger.log_prompt("user", prompt, "Incorporate Critiques")
 
@@ -208,13 +339,59 @@ class HypothesisGenerator:
 
     def get_feedback(self, analysis, past_analyses, notebook_cells, num_steps_left, iterations=1):
         current_analysis = analysis
+        is_ollama = self.model_name.startswith("ollama")
         for i in range(iterations):
-            feedback = self.critique_step(current_analysis, past_analyses, notebook_cells, num_steps_left)
-            current_analysis = self.incorporate_critique(
-                current_analysis, feedback, notebook_cells, num_steps_left
-            )
+            try:
+                feedback = self.critique_step(current_analysis, past_analyses, notebook_cells, num_steps_left)
+                revised = self.incorporate_critique(
+                    current_analysis, feedback, notebook_cells, num_steps_left
+                )
+                # For small local models, validate the revised analysis isn't degraded.
+                # Common failure mode: model loses context and hallucinates packages/data paths.
+                if is_ollama and not self._is_valid_revision(current_analysis, revised):
+                    print("⚠️ Self-critique produced a degraded analysis — keeping original")
+                    continue
+                current_analysis = revised
+            except Exception as e:
+                print(f"⚠️ Self-critique iteration {i+1} failed: {e} — keeping current analysis")
+                continue
 
         return current_analysis
+
+    @staticmethod
+    def _is_valid_revision(original: dict, revised: dict) -> bool:
+        """Check whether a revised analysis is plausible (not hallucinated)."""
+        code = revised.get("first_step_code", "")
+        # Reject if the code imports packages not in the allowed set
+        _ALLOWED_IMPORTS = {
+            "scanpy", "sc", "scvi", "anndata", "ad", "matplotlib", "plt",
+            "numpy", "np", "seaborn", "sns", "pandas", "pd", "scipy",
+            "stats", "warnings", "os", "sys", "json", "re", "math",
+            "collections", "itertools", "functools", "pathlib",
+        }
+        import re as _re
+        imports = set()
+        for m in _re.finditer(r"^\s*(?:import|from)\s+(\w+)", code, _re.MULTILINE):
+            imports.add(m.group(1))
+        hallucinated = imports - _ALLOWED_IMPORTS
+        if hallucinated:
+            print(f"  ⚠️ Revised code imports unknown packages: {hallucinated}")
+            return False
+        # Reject if the code tries to load data from files that aren't .h5ad
+        # (common hallucination: read_csv, read_cellranger, etc.)
+        if _re.search(r"read_csv|read_excel|read_cellranger|\.csv|\.tsv|\.rdR", code):
+            if "read_h5ad" not in code and "adata" not in code.split("read_csv")[0] if "read_csv" in code else True:
+                print("  ⚠️ Revised code tries to load non-h5ad data files")
+                return False
+        # Reject if the hypothesis became completely generic
+        hyp = revised.get("hypothesis", "").lower()
+        _GENERIC_MARKERS = ["environmental conditions", "generic analysis", "general exploration"]
+        if any(g in hyp for g in _GENERIC_MARKERS):
+            orig_hyp = original.get("hypothesis", "").lower()
+            if not any(g in orig_hyp for g in _GENERIC_MARKERS):
+                print("  ⚠️ Revised hypothesis became generic")
+                return False
+        return True
 
     def generate_idea(self, past_analyses, analysis_idx=None, seeded_hypothesis=None):
         """

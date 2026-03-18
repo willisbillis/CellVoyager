@@ -19,6 +19,7 @@ if _project_root not in sys.path:
 import streamlit as st
 
 import gui.common as g
+from gui.ollama_utils import list_local_models, is_ollama_reachable, pull_model_streaming, resolve_model_name
 
 ROOT = g.ROOT
 UPLOADS_DIR = g.UPLOADS_DIR
@@ -708,18 +709,80 @@ with st.sidebar:
         "claude-opus-4-5",
         "claude-haiku-4-5",
     ]
+    # Well-known Ollama models offered in the dropdown (users can also type custom ones)
+    _OLLAMA_SUGGESTED = [
+        "llama3.1",
+        "qwen2.5-coder",
+        "mistral",
+        "deepseek-coder-v2",
+    ]
     _DEFAULT_EXEC_MODEL = "claude-sonnet-4-6"
-    if st.session_state.get("home_execution_model") not in _EXEC_MODEL_OPTIONS:
+
+    # Query Ollama for downloaded models (cached briefly so the sidebar stays snappy)
+    _ollama_base = st.session_state.get("home_ollama_base_url", "http://localhost:11434")
+    _ollama_reachable = is_ollama_reachable(_ollama_base, timeout=1.5)
+    _ollama_local_models: list[str] = list_local_models(_ollama_base, timeout=2.0) if _ollama_reachable else []
+    # Bare name → set of full names (e.g. "ministral-3" → {"ministral-3:14b"})
+    _ollama_local_bare = {m.split(":")[0] for m in _ollama_local_models}
+
+    def _ollama_label(display_name: str) -> str:
+        """Format an Ollama model name for display with download status."""
+        bare = display_name.split(":")[0]
+        if bare in _ollama_local_bare or any(m.startswith(bare) for m in _ollama_local_models):
+            return f"ollama/{display_name}  ✅"
+        return f"ollama/{display_name}  ⬇️"
+
+    # Build the full exec-model list: cloud models + Ollama models + any extra local models.
+    # For extra local models use their FULL name (with tag) so Ollama can always find them.
+    _extra_local = sorted(
+        m for m in _ollama_local_models
+        if m.split(":")[0] not in _OLLAMA_SUGGESTED
+    )
+    _exec_all = (
+        _EXEC_MODEL_OPTIONS
+        + [f"ollama/{n}" for n in _OLLAMA_SUGGESTED]
+        + [f"ollama/{n}" for n in _extra_local]
+    )
+
+    def _exec_format(m: str) -> str:
+        if m.startswith("ollama/"):
+            bare = m[len("ollama/"):]
+            return _ollama_label(bare)
+        return m
+
+    if st.session_state.get("home_execution_model") not in _exec_all:
         st.session_state["home_execution_model"] = _DEFAULT_EXEC_MODEL
     st.selectbox(
         "Execution model",
-        _EXEC_MODEL_OPTIONS,
-        index=_EXEC_MODEL_OPTIONS.index(st.session_state.get("home_execution_model", _DEFAULT_EXEC_MODEL)),
+        _exec_all,
+        index=_exec_all.index(st.session_state.get("home_execution_model", _DEFAULT_EXEC_MODEL)),
         key="home_execution_model",
+        format_func=_exec_format,
         help="LLM to use to execute the analyses",
     )
 
-    _MODEL_PRESETS = [
+    # If the selected execution model is an Ollama model that isn't downloaded, offer to pull it
+    _sel_exec = st.session_state.get("home_execution_model", "")
+    if _sel_exec.startswith("ollama/"):
+        _sel_exec_bare = _sel_exec[len("ollama/"):]
+        if _sel_exec_bare not in _ollama_local_bare and not any(m.startswith(_sel_exec_bare) for m in _ollama_local_models):
+            if not _ollama_reachable:
+                st.warning("⚠️ Ollama server not reachable. Start it with `ollama serve`.")
+            elif st.button(f"⬇️ Download **{_sel_exec_bare}**", key="_dl_exec_model"):
+                _bar = st.progress(0, text=f"Pulling {_sel_exec_bare}...")
+                try:
+                    for event in pull_model_streaming(_sel_exec_bare, _ollama_base):
+                        total = event.get("total", 0)
+                        completed = event.get("completed", 0)
+                        pct = completed / total if total else 0
+                        _bar.progress(min(pct, 1.0), text=event.get("status", "downloading..."))
+                    _bar.progress(1.0, text="✅ Download complete!")
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"Download failed: {e}")
+
+    # ---- Hypothesis generation model ----
+    _CLOUD_PRESETS = [
         "claude-sonnet-4-6",
         "claude-opus-4-6",
         "claude-sonnet-4-5",
@@ -731,19 +794,38 @@ with st.sidebar:
         "o1",
         "gpt-4o",
         "gpt-4o-mini",
-        "Custom...",
     ]
+    _MODEL_PRESETS = (
+        _CLOUD_PRESETS
+        + [f"ollama/{n}" for n in _OLLAMA_SUGGESTED]
+        + [f"ollama/{n}" for n in _extra_local]
+        + ["Custom..."]
+    )
+    # Build a lookup to resolve bare Ollama names → full tag names for the run command
+    _ollama_resolve_map: dict[str, str] = {}
+    for _m in _ollama_local_models:
+        _b = _m.split(":")[0]
+        if _b not in _ollama_resolve_map:  # keep first (alphabetical) match
+            _ollama_resolve_map[_b] = _m
     _DEFAULT_MODEL = "claude-sonnet-4-6"
     if st.session_state.get("home_model_name") in (None, "", "o3-mini"):
         st.session_state["home_model_name"] = _DEFAULT_MODEL
     _current_model = st.session_state.get("home_model_name", _DEFAULT_MODEL)
     _preset_val = _current_model if _current_model in _MODEL_PRESETS else "Custom..."
+
+    def _hyp_format(m: str) -> str:
+        if m.startswith("ollama/"):
+            bare = m[len("ollama/"):]
+            return _ollama_label(bare)
+        return m
+
     _selected_preset = st.selectbox(
         "Hypothesis generation model",
         _MODEL_PRESETS,
         index=_MODEL_PRESETS.index(_preset_val),
         key="_home_model_preset",
-        help="OpenAI or Anthropic model for hypothesis/critique generation",
+        format_func=_hyp_format,
+        help="OpenAI, Anthropic, or Ollama model for hypothesis/critique generation",
     )
     if _selected_preset == "Custom...":
         _custom = st.text_input("Custom model name", value=_current_model if _preset_val == "Custom..." else "", key="_home_model_custom")
@@ -751,18 +833,53 @@ with st.sidebar:
     else:
         st.session_state["home_model_name"] = _selected_preset
 
+    # If the selected hypothesis model is an Ollama model that isn't downloaded, offer to pull it
+    _sel_hyp = st.session_state.get("home_model_name", "")
+    if _sel_hyp.startswith("ollama/"):
+        _sel_hyp_bare = _sel_hyp[len("ollama/"):]
+        if _sel_hyp_bare not in _ollama_local_bare and not any(m.startswith(_sel_hyp_bare) for m in _ollama_local_models):
+            if not _ollama_reachable:
+                st.warning("⚠️ Ollama server not reachable. Start it with `ollama serve`.")
+            elif st.button(f"⬇️ Download **{_sel_hyp_bare}**", key="_dl_hyp_model"):
+                _bar = st.progress(0, text=f"Pulling {_sel_hyp_bare}...")
+                try:
+                    for event in pull_model_streaming(_sel_hyp_bare, _ollama_base):
+                        total = event.get("total", 0)
+                        completed = event.get("completed", 0)
+                        pct = completed / total if total else 0
+                        _bar.progress(min(pct, 1.0), text=event.get("status", "downloading..."))
+                    _bar.progress(1.0, text="✅ Download complete!")
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"Download failed: {e}")
+
     _model_for_validation = st.session_state.get("home_model_name", _DEFAULT_MODEL)
     def _model_provider(m):
+        if m.startswith("ollama/") or m.startswith("ollama_chat/"):
+            return "ollama"
         if m.startswith("claude-") or m.startswith("anthropic/"):
             return "anthropic"
         if m.startswith("gpt-") or m.startswith("o1") or m.startswith("o3") or m.startswith("o4"):
             return "openai"
         return "unknown"
     _provider = _model_provider(_model_for_validation)
+    _exec_provider = _model_provider(st.session_state.get("home_execution_model", _DEFAULT_EXEC_MODEL))
+    _is_ollama_exec = _exec_provider == "ollama"
+
+    # Ollama base URL (shown when any selected model uses Ollama)
+    if _is_ollama_exec or _provider == "ollama":
+        st.text_input(
+            "Ollama base URL",
+            value=st.session_state.get("home_ollama_base_url", "http://localhost:11434"),
+            key="home_ollama_base_url",
+            help="URL of your local Ollama server",
+        )
 
     st.divider()
     api_keys_ok = True
-    if _provider == "openai":
+    if _provider == "ollama":
+        st.caption(f"Using local Ollama model `{_model_for_validation}` (no API key needed)")
+    elif _provider == "openai":
         if not os.getenv("OPENAI_API_KEY"):
             st.error("OPENAI_API_KEY not set")
             api_keys_ok = False
@@ -779,7 +896,8 @@ with st.sidebar:
         if not os.getenv("OPENAI_API_KEY") and not os.getenv("ANTHROPIC_API_KEY"):
             st.error("No API keys set (OPENAI_API_KEY or ANTHROPIC_API_KEY)")
             api_keys_ok = False
-    if not os.getenv("ANTHROPIC_API_KEY"):
+    # Claude execution agent needs ANTHROPIC_API_KEY; Ollama execution does not
+    if not _is_ollama_exec and not os.getenv("ANTHROPIC_API_KEY"):
         st.error("ANTHROPIC_API_KEY not set (required for Claude execution agent)")
         api_keys_ok = False
 
@@ -962,14 +1080,27 @@ context_source: structured_fields
     _model_name = st.session_state.home_model_name
     _execution_model = st.session_state.get("home_execution_model", "claude-sonnet-4-6")
     _h5ad_path = str(FIXED_H5AD_PATH) if DEMO_MODE else st.session_state.get("home_h5ad_path")
-    # Claude execution agent always needs ANTHROPIC_API_KEY; hypothesis model needs its own key
+    # Determine execution mode from selected execution model
+    _is_ollama_run = _execution_model.startswith("ollama/") or _execution_model.startswith("ollama_chat/")
+    _exec_mode = "ollama" if _is_ollama_run else "claude"
+    # Provider check for hypothesis model
     def __model_provider(m):
+        if m.startswith("ollama/") or m.startswith("ollama_chat/"):
+            return "ollama"
         if m.startswith("claude-") or m.startswith("anthropic/"):
             return "anthropic"
         return "openai"
     _hyp_provider = __model_provider(_model_name)
-    _hyp_key_ok = bool(os.getenv("OPENAI_API_KEY")) if _hyp_provider == "openai" else bool(os.getenv("ANTHROPIC_API_KEY"))
-    _api_ok = _hyp_key_ok and bool(os.getenv("ANTHROPIC_API_KEY"))
+    if _hyp_provider == "ollama":
+        _hyp_key_ok = True  # Ollama needs no API key
+    elif _hyp_provider == "openai":
+        _hyp_key_ok = bool(os.getenv("OPENAI_API_KEY"))
+    else:
+        _hyp_key_ok = bool(os.getenv("ANTHROPIC_API_KEY"))
+    if _is_ollama_run:
+        _api_ok = _hyp_key_ok  # Ollama exec needs no cloud API keys
+    else:
+        _api_ok = _hyp_key_ok and bool(os.getenv("ANTHROPIC_API_KEY"))
     _has_h5ad = _h5ad_path and Path(_h5ad_path).exists()
     if context_source == "Structured fields":
         _has_paper = bool((st.session_state.get("home_dataset_summary") or "").strip())
@@ -1016,15 +1147,17 @@ context_source: structured_fields
             "h5ad_path": str(h5ad_path),
             "paper_path": str(paper_path),
             "analysis_name": _analysis_name,
-            "execution_mode": "claude",
+            "execution_mode": _exec_mode,
             "max_iterations": int(_max_iterations),
             "model_name": _model_name,
             "execution_model": _execution_model,
-            "use_deepresearch": _use_deepresearch,
+            "use_deepresearch": _use_deepresearch if _exec_mode != "ollama" else False,
             "intervene_every": int(_intervene_every),
             "ding_on_pause": bool(st.session_state.get("home_ding_on_pause", False)),
             "num_analyses": int(_num_analyses),
         }
+        if _exec_mode == "ollama":
+            run_config["ollama_base_url"] = st.session_state.get("home_ollama_base_url", "http://localhost:11434")
         (run_output_dir / g._RUN_CONFIG_FILE).write_text(json.dumps(run_config), encoding="utf-8")
         cmd = [
             sys.executable, str(ROOT / "run_cellvoyager.py"),
@@ -1033,7 +1166,7 @@ context_source: structured_fields
             "--analysis-name", _analysis_name,
             "--num-analyses", str(_num_analyses),
             "--max-iterations", str(int(_max_iterations)),
-            "--execution-mode", "claude",
+            "--execution-mode", _exec_mode,
             "--model-name", _model_name,
             "--output-home", str(ROOT),
             "--log-home", str(ROOT / "logs"),
@@ -1042,11 +1175,16 @@ context_source: structured_fields
         # Always enable interactive plumbing for GUI-driven pause/continue.
         # If step-by-step mode is off, use a very large intervene interval so pauses
         # only happen when the user clicks Stop.
-        intervene = int(_intervene_every) if _interactive_mode else 999999
-        cmd.extend(["--interactive", "--intervene-every", str(intervene)])
-        if _execution_model:
+        if _exec_mode != "ollama":  # interactive mode only for claude execution
+            intervene = int(_intervene_every) if _interactive_mode else 999999
+            cmd.extend(["--interactive", "--intervene-every", str(intervene)])
+        if _exec_mode == "claude" and _execution_model:
             cmd.extend(["--execution-model", _execution_model])
-        if _use_deepresearch:
+        if _exec_mode == "ollama":
+            cmd.extend(["--ollama-base-url", st.session_state.get("home_ollama_base_url", "http://localhost:11434")])
+            cmd.append("--no-vlm")
+            # Self-critique is auto-disabled for ollama in run_cellvoyager.py
+        if _use_deepresearch and _exec_mode != "ollama":
             cmd.append("--deepresearch")
         env = os.environ.copy()
         env["PYTHONUNBUFFERED"] = "1"

@@ -26,9 +26,9 @@ class AnalysisAgentV2:
         self,
         h5ad_path,
         paper_summary_path,
-        openai_api_key,
-        model_name,
-        analysis_name,
+        openai_api_key=None,
+        model_name="claude-sonnet-4-6",
+        analysis_name="analysis",
         num_analyses=5,
         max_iterations=6,
         prompt_dir=None,
@@ -47,11 +47,13 @@ class AnalysisAgentV2:
     ):
         """
         Args:
-            execution_mode: "legacy" (default) uses IdeaExecutor;
-                "claude" uses ClaudeJupyterExecutor from execution.py (live Jupyter + Claude Agent SDK).
+            execution_mode: "legacy" uses IdeaExecutor (OpenAI client);
+                "claude" uses ClaudeJupyterExecutor (live Jupyter + Claude Agent SDK);
+                "ollama" uses IdeaExecutor routed through LiteLLM to a local Ollama server.
             anthropic_api_key: Required when execution_mode="claude". Can also set ANTHROPIC_API_KEY env.
             **execution_kwargs: Passed to ClaudeJupyterExecutor when execution_mode="claude",
                 e.g. jupyter_port=8888, auto_start_jupyter=True, stop_jupyter_on_complete=False.
+                For execution_mode="ollama", accepts ollama_base_url (default http://localhost:11434).
         """
         self.h5ad_path = h5ad_path
         self.paper_summary = open(paper_summary_path).read()
@@ -63,6 +65,19 @@ class AnalysisAgentV2:
         self.prompt_dir = prompt_dir or os.path.join(os.path.dirname(__file__), "prompts")
         self.log_prompts = log_prompts
         self.max_fix_attempts = max_fix_attempts
+
+        # Ollama mode: set OLLAMA_API_BASE for LiteLLM and disable cloud-only features
+        if execution_mode == "ollama":
+            ollama_base_url = execution_kwargs.pop("ollama_base_url", "http://localhost:11434")
+            os.environ.setdefault("OLLAMA_API_BASE", ollama_base_url)
+            # Resolve bare Ollama model name to the actual downloaded tag.
+            # e.g. "ollama/ministral-3" → "ollama/ministral-3:14b" if only :14b is installed.
+            self.model_name = self._resolve_ollama_model(self.model_name, ollama_base_url)
+            # DeepResearch requires OpenAI's proprietary deep-research API
+            if use_deepresearch_background:
+                print("⚠️  DeepResearch disabled for Ollama mode (requires OpenAI API)")
+            use_deepresearch_background = False
+
         self.use_deepresearch_background = use_deepresearch_background
 
         if output_dir is not None:
@@ -71,7 +86,11 @@ class AnalysisAgentV2:
             timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
             self.output_dir = os.path.join(output_home, "outputs", f"{analysis_name}_{timestamp}")
 
-        self.client = openai.OpenAI(api_key=openai_api_key)
+        # OpenAI client is only needed for legacy mode and DeepResearch
+        if openai_api_key:
+            self.client = openai.OpenAI(api_key=openai_api_key)
+        else:
+            self.client = None
 
         self.use_self_critique = use_self_critique
         self.use_VLM = use_VLM
@@ -177,7 +196,46 @@ class AnalysisAgentV2:
                 **execution_kwargs,
             )
         else:
+            # Both "legacy" and "ollama" use IdeaExecutor (LiteLLM routes to the right backend)
             self.executor = IdeaExecutor(**shared_executor_kwargs)
+
+    @staticmethod
+    def _resolve_ollama_model(model_name: str, base_url: str) -> str:
+        """Resolve a bare Ollama model name to its actual downloaded tag.
+
+        Ollama only auto-resolves ``name`` → ``name:latest``.  If the user
+        installed e.g. ``ministral-3:14b`` (no ``:latest`` alias), a request
+        for ``ollama/ministral-3`` would fail.  This queries the local server
+        and returns the correct full name like ``ollama/ministral-3:14b``.
+        """
+        if not model_name.startswith("ollama/"):
+            return model_name
+        bare = model_name[len("ollama/"):]
+        try:
+            from gui.ollama_utils import resolve_model_name
+            resolved = resolve_model_name(bare, base_url)
+        except Exception:
+            # gui package may not be on path — inline a minimal resolver
+            resolved = bare
+            try:
+                import json, urllib.request
+                req = urllib.request.Request(f"{base_url}/api/tags")
+                with urllib.request.urlopen(req, timeout=3) as resp:  # noqa: S310
+                    data = json.loads(resp.read())
+                names = [m["name"] for m in data.get("models", [])]
+                if bare in names:
+                    resolved = bare
+                elif f"{bare}:latest" in names:
+                    resolved = f"{bare}:latest"
+                else:
+                    matches = [n for n in names if n.split(":")[0] == bare]
+                    if matches:
+                        resolved = sorted(matches)[0]
+            except Exception:
+                pass
+        if resolved != bare:
+            print(f"ℹ️  Resolved Ollama model: {bare} → {resolved}")
+        return f"ollama/{resolved}"
 
     def _summarize_adata_full(self, h5ad_path, length_cutoff=25):
         """Summarize all AnnData attributes: .obs, .var, .obsm, .layers, .uns, .obsp, .varp."""

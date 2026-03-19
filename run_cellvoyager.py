@@ -191,6 +191,14 @@ def main():
 
     args = parser.parse_args()
 
+    # For resume mode, override execution_mode from the saved config so that
+    # API-key checks and model defaults use the correct mode.
+    if args.resume and args.resume_output_dir:
+        _resume_cfg_path = Path(args.resume_output_dir) / ".run_config.json"
+        if _resume_cfg_path.exists():
+            _resume_cfg = json.loads(_resume_cfg_path.read_text(encoding="utf-8"))
+            args.execution_mode = _resume_cfg.get("execution_mode", args.execution_mode)
+
     # Default model name based on execution mode
     if args.model_name is None:
         if args.execution_mode == "ollama":
@@ -231,25 +239,29 @@ def main():
         if not notebook_path.exists():
             print(f"❌ Error: Notebook not found: {notebook_path}")
             return 1
-        anthropic_api_key = args.anthropic_api_key or os.getenv("ANTHROPIC_API_KEY")
-        if not anthropic_api_key:
-            print("❌ Error: ANTHROPIC_API_KEY required for resume (claude execution)")
-            return 1
         exec_mode = cfg.get("execution_mode", "claude")
-        if exec_mode != "claude":
-            print("❌ Error: Resume only supports execution_mode=claude")
-            return 1
+        anthropic_api_key = None
+        if exec_mode == "claude":
+            anthropic_api_key = args.anthropic_api_key or os.getenv("ANTHROPIC_API_KEY")
+            if not anthropic_api_key:
+                print("❌ Error: ANTHROPIC_API_KEY required for resume (claude execution)")
+                return 1
         intervene = args.resume_intervene_every if args.resume_intervene_every is not None else cfg.get("intervene_every", 1)
-        print("🔄 Resume mode: restoring kernel state, then entering interactive mode...")
+        print(f"🔄 Resume mode ({exec_mode}): restoring kernel state, then entering interactive mode...")
         resume_exec_kwargs = {
-            "jupyter_port": args.jupyter_port,
-            "jupyter_token": args.jupyter_token,
-            "auto_start_jupyter": not args.no_auto_start_jupyter,
-            "stop_jupyter_on_complete": args.stop_jupyter_on_complete,
             "interactive_mode": True,
             "intervene_every": intervene,
             "execution_model": args.execution_model or cfg.get("execution_model"),
         }
+        if exec_mode == "claude":
+            resume_exec_kwargs.update({
+                "jupyter_port": args.jupyter_port,
+                "jupyter_token": args.jupyter_token,
+                "auto_start_jupyter": not args.no_auto_start_jupyter,
+                "stop_jupyter_on_complete": args.stop_jupyter_on_complete,
+            })
+        if exec_mode == "ollama":
+            resume_exec_kwargs["ollama_base_url"] = cfg.get("ollama_base_url", args.ollama_base_url)
         agent = AnalysisAgentV2(
             h5ad_path=cfg["h5ad_path"],
             paper_summary_path=cfg["paper_path"],

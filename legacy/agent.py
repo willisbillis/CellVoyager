@@ -22,7 +22,7 @@ class AnalysisAgent:
     def __init__(self, h5ad_path, paper_summary_path, openai_api_key, model_name, analysis_name, 
                 num_analyses=5, max_iterations=6, prompt_dir=None, output_home=".", log_home=".",
                 use_self_critique=True, use_VLM=True, use_documentation=True, log_prompts = False,
-                max_fix_attempts=3, use_deepresearch_background=True):
+                max_fix_attempts=5, use_deepresearch_background=True):
         self.h5ad_path = h5ad_path
         self.paper_summary = open(paper_summary_path).read()
         self.openai_api_key = openai_api_key

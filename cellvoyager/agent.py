@@ -39,7 +39,7 @@ class AnalysisAgentV2:
         use_VLM=True,
         use_documentation=True,
         log_prompts=False,
-        max_fix_attempts=3,
+        max_fix_attempts=5,
         use_deepresearch_background=True,
         execution_mode="legacy",
         anthropic_api_key=None,

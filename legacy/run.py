@@ -38,8 +38,8 @@ def main():
     
     parser.add_argument("--max-fix-attempts", 
                        type=int, 
-                       default=3,
-                       help="Maximum fix attempts per step (default: 3)")
+                       default=5,
+                       help="Maximum fix attempts per step (default: 5)")
     
     parser.add_argument("--output-home", 
                        default=".",

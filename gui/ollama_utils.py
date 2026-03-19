@@ -102,6 +102,62 @@ def pull_model_streaming(model_name: str, base_url: str = DEFAULT_BASE_URL):
                 continue
 
 
+def get_model_metadata(model_name: str, base_url: str = DEFAULT_BASE_URL, timeout: float = 3.0) -> Optional[dict]:
+    """Return model metadata from Ollama /api/show, or None on error."""
+    try:
+        payload = json.dumps({"name": model_name}).encode("utf-8")
+        req = urllib.request.Request(
+            f"{base_url}/api/show",
+            data=payload,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310
+            return json.loads(resp.read())
+    except Exception:
+        return None
+
+
+def model_supports_vision(model_name: str, base_url: str = DEFAULT_BASE_URL, timeout: float = 3.0) -> Optional[bool]:
+    """Best-effort detection of whether an Ollama model supports vision.
+
+    Returns:
+    * True if metadata indicates vision/image support
+    * False if metadata appears to indicate no vision support
+    * None if support could not be determined (e.g., server/model unavailable)
+    """
+    data = get_model_metadata(model_name, base_url=base_url, timeout=timeout)
+    if not data:
+        return None
+
+    capabilities = data.get("capabilities")
+    if isinstance(capabilities, list):
+        cap_tokens = {str(c).lower() for c in capabilities}
+        if any(("vision" in c or "image" in c) for c in cap_tokens):
+            return True
+        return False
+
+    positive_tokens = (
+        "vision",
+        "image",
+        "llava",
+        "bakllava",
+        "minicpm-v",
+        "qwen2-vl",
+        "qwen2.5-vl",
+        "qwen2.5vl",
+        "moondream",
+        "mllama",
+        "gemma3",
+    )
+    blob = json.dumps(data).lower()
+    if any(token in blob for token in positive_tokens):
+        return True
+
+    # We received metadata but no vision/image indicators.
+    return False
+
+
 def pull_model_sync(
     model_name: str,
     base_url: str = DEFAULT_BASE_URL,

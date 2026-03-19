@@ -586,16 +586,19 @@ with st.sidebar:
             _completed_analyses = g._collect_notebooks_by_analysis(_completed_out_dir, _completed_num)
             _cfg_path_done = Path(_completed_out_dir) / g._RUN_CONFIG_FILE
             _resume_restoring = st.session_state.get("_resume_restoring")
+            _can_resume_done = g._can_resume_run(_completed_out_dir)
             for _aidx, _nb in _completed_analyses:
                 if _nb:
                     if _resume_restoring == (_completed_out_dir, _aidx):
                         st.info(f"Restoring Analysis {_aidx} (re-running the notebook)...")
-                    elif _cfg_path_done.exists():
+                    elif _cfg_path_done.exists() and _can_resume_done:
                         _lbl = f"▶ Continue Analysis {_aidx}" if _completed_num > 1 else "▶ Continue further"
                         if st.button(_lbl, key=f"sb_continue_further_{_aidx}", width="stretch"):
                             st.session_state._resume_restoring = (_completed_out_dir, _aidx)
                             g._launch_resume(_completed_out_dir, _aidx)
                             st.rerun()
+            if _cfg_path_done.exists() and not _can_resume_done:
+                st.caption("Continue further is only available for Claude execution runs.")
             st.markdown('<div style="margin-bottom:0.5rem"></div>', unsafe_allow_html=True)
         if st.button("Finish Analysis", type="primary", width="stretch", help="Return to home and start a new analysis"):
             st.session_state.run_output_dir = None
@@ -1066,6 +1069,9 @@ elif st.session_state.get("run_output_dir") and not st.session_state.get("run_st
                     st.session_state[f"pause_edit_mode_{pause_id}"] = True
                     st.rerun()
                 elif continue_clicked:
+                    if not g._can_resume_run(st.session_state.run_output_dir):
+                        st.warning("Continue from stop is only available for Claude execution runs.")
+                        st.stop()
                     st.session_state.run_show_interactive = False
                     if request_path and request_path.exists():
                         request_path.unlink(missing_ok=True)

@@ -134,6 +134,128 @@ def strip_code_markers(text):
     return re.sub(r"```python|```", "", text)
 
 
+def _process_chat_request(output_dir: str, notebook: nbf.NotebookNode, analysis_idx: int | None = None) -> bool:
+    """
+    Check for chat requests from the GUI and respond via notebook context.
+    Returns True if a request was processed, False otherwise.
+    """
+    from pathlib import Path
+    
+    if not output_dir:
+        return False
+    
+    out_path = Path(output_dir)
+    req_file = out_path / ".cellvoyager_chat_request"
+    resp_file = out_path / ".cellvoyager_chat_response"
+    
+    # Check if a chat request exists
+    if not req_file.exists():
+        return False
+    
+    try:
+        req_data = json.loads(req_file.read_text(encoding="utf-8"))
+        user_message = req_data.get("message", "")
+        conversation = req_data.get("conversation", [])
+        
+        if not user_message:
+            return False
+        
+        # Build context from notebook cells
+        context_parts = []
+        for cell in notebook.cells[-30:]:  # Last 30 cells for context
+            src = cell.get("source", "")
+            if isinstance(src, list):
+                src = "".join(src)
+            if src and src.strip():
+                if cell.get("cell_type") == "code":
+                    context_parts.append(f"```python\n{src}\n```")
+                else:
+                    context_parts.append(src[:500])
+        
+        context = "\n\n".join(context_parts)[:10000]
+        
+        # Prepare messages for API call
+        system = (
+            "You are the analysis agent that is currently running this single-cell transcriptomics analysis. "
+            "The user is asking about the analysis results. Answer their questions concisely and accurately "
+            "based on the notebook code and results shown below.\n\n"
+            "Recent notebook context:\n" + (context or "(no notebook content available)")
+        )
+        
+        api_messages = [{"role": m.get("role", "user"), "content": m.get("content", "")} for m in conversation]
+        api_messages.append({"role": "user", "content": user_message})
+        
+        response_text = None
+        
+        # Try Ollama first (if configured)
+        ollama_base_url = os.getenv("OLLAMA_API_BASE")
+        if ollama_base_url:
+            try:
+                # Use LiteLLM to query Ollama model
+                # Detect chat model from environment or use default
+                ollama_model = os.getenv("CELLVOYAGER_CHAT_MODEL", "ollama/llama3.1")
+                resp = litellm.completion(
+                    model=ollama_model,
+                    messages=api_messages,
+                    system=system,
+                    max_tokens=1024,
+                    temperature=0.7,
+                )
+                if resp.choices and len(resp.choices) > 0:
+                    response_text = (resp.choices[0].message.content or "").strip()
+            except Exception as e:
+                print(f"⚠️ Ollama chat error: {e}")
+        
+        # Try Anthropic
+        if response_text is None:
+            anthropic_key = os.getenv("ANTHROPIC_API_KEY")
+            if anthropic_key:
+                try:
+                    import anthropic as anthropic_module
+                    client = anthropic_module.Anthropic(api_key=anthropic_key)
+                    resp = client.messages.create(
+                        model="claude-sonnet-4-5",
+                        max_tokens=1024,
+                        system=system,
+                        messages=api_messages,
+                    )
+                    if resp.content and len(resp.content) > 0:
+                        response_text = resp.content[0].text.strip()
+                except Exception as e:
+                    print(f"⚠️ Anthropic chat error: {e}")
+        
+        # Fallback to OpenAI
+        if response_text is None:
+            openai_key = os.getenv("OPENAI_API_KEY")
+            if openai_key:
+                try:
+                    from openai import OpenAI
+                    client = OpenAI(api_key=openai_key)
+                    system_msgs = [{"role": "system", "content": system}]
+                    resp = client.chat.completions.create(
+                        model="gpt-4o-mini",
+                        messages=system_msgs + api_messages,
+                        max_tokens=1024,
+                    )
+                    response_text = (resp.choices[0].message.content or "").strip()
+                except Exception as e:
+                    print(f"⚠️ OpenAI chat error: {e}")
+        
+        # Write response
+        if response_text:
+            resp_file.write_text(
+                json.dumps({"response": response_text}, ensure_ascii=False),
+                encoding="utf-8",
+            )
+            req_file.unlink(missing_ok=True)
+            return True
+        
+    except Exception as e:
+        print(f"⚠️ Chat processing error: {e}")
+    
+    return False
+
+
 class IdeaExecutor:
     """
     Executes analysis ideas (hypotheses) as Jupyter notebooks.
@@ -776,6 +898,9 @@ print(f"Data loaded: {{adata.shape[0]}} cells and {{adata.shape[1]}} genes")
                     f"### Agent Interpretation\n\n{results_interpretation}"
                 )
                 notebook.cells.append(interpretation_cell)
+                
+                # Process any pending chat requests
+                _process_chat_request(self.output_dir, notebook, analysis_idx)
 
             else:
                 print(f"⚠️ Code errored with: {error_msg}")
@@ -860,6 +985,9 @@ print(f"Data loaded: {{adata.shape[0]}} cells and {{adata.shape[1]}} genes")
                         f"### Agent Interpretation\n\n{results_interpretation}"
                     )
                     notebook.cells.append(interpretation_cell)
+                
+                # Process any pending chat requests
+                _process_chat_request(self.output_dir, notebook, analysis_idx)
 
             hypotheses_analysis.append(hypothesis)
 

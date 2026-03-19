@@ -140,6 +140,11 @@ def main():
         help="Disable Vision Language Model functionality",
     )
     parser.add_argument(
+        "--vlm",
+        action="store_true",
+        help="Enable Vision Language Model functionality (opt-in for Ollama mode)",
+    )
+    parser.add_argument(
         "--no-documentation",
         action="store_true",
         help="Disable documentation functionality",
@@ -206,8 +211,12 @@ def main():
         else:
             args.model_name = "claude-sonnet-4-6"
 
+    if args.vlm and args.no_vlm:
+        print("❌ Error: --vlm and --no-vlm cannot be used together")
+        return 1
+
     # Ollama mode: VLM off by default (most local models lack vision)
-    if args.execution_mode == "ollama" and not args.no_vlm:
+    if args.execution_mode == "ollama" and not args.no_vlm and not args.vlm:
         args.no_vlm = True
 
     # Check if OpenAI API key is available (not required for ollama mode)
@@ -240,6 +249,11 @@ def main():
             print(f"❌ Error: Notebook not found: {notebook_path}")
             return 1
         exec_mode = cfg.get("execution_mode", "claude")
+        if exec_mode == "ollama":
+            print("❌ Error: Resume is currently only supported for execution_mode=claude.")
+            print("   Ollama runs cannot restore an interactive kernel session yet.")
+            print("   Start a new run to continue analysis for now.")
+            return 1
         anthropic_api_key = None
         if exec_mode == "claude":
             anthropic_api_key = args.anthropic_api_key or os.getenv("ANTHROPIC_API_KEY")

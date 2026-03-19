@@ -20,10 +20,29 @@ import markdown as _markdown
 import streamlit as st
 
 
+def _can_resume_run(output_dir: str) -> bool:
+    """Return True only for run configs that support resume."""
+    cfg_path = Path(output_dir) / _RUN_CONFIG_FILE
+    if not cfg_path.exists():
+        return False
+    try:
+        cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
+    except Exception:
+        return False
+    return cfg.get("execution_mode", "claude") == "claude"
+
+
 def _launch_resume(output_dir: str, analysis_idx: int, run_to_completion: bool = False) -> None:
     """Launch run_v2 in resume mode for the given analysis. Sets session state and reruns.
     If run_to_completion=True (e.g. when resuming from Stop), use high intervene_every so the agent
     runs to completion without pausing for feedback."""
+    if not _can_resume_run(output_dir):
+        st.session_state["run_error"] = (
+            "Resume is currently only supported for Claude execution mode. "
+            "This run uses Ollama, so please start a new analysis to continue."
+        )
+        return
+
     out_dir = Path(output_dir)
     # Clear stale pause/step/stop files so we don't show wrong UI from previous stopped run
     for f in (_PAUSE_REQUEST_FILE, _PAUSE_RESPONSE_FILE, _STEP_COUNT_FILE, _STOP_REQUEST_FILE, _KILL_CELL_FILE, _RUNNING_CELL_FILE):
@@ -99,6 +118,7 @@ for key, default in [
     ("home_interactive_mode", True),
     ("home_intervene_every", 1),
     ("home_ding_on_pause", False),
+    ("home_enable_vlm", False),
     ("home_use_deepresearch", False),
     ("home_model_name", "o3-mini"),
     ("session_runs", []),

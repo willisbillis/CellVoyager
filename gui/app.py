@@ -19,7 +19,13 @@ if _project_root not in sys.path:
 import streamlit as st
 
 import gui.common as g
-from gui.ollama_utils import list_local_models, is_ollama_reachable, pull_model_streaming, resolve_model_name
+from gui.ollama_utils import (
+    list_local_models,
+    is_ollama_reachable,
+    model_supports_vision,
+    pull_model_streaming,
+    resolve_model_name,
+)
 
 ROOT = g.ROOT
 UPLOADS_DIR = g.UPLOADS_DIR
@@ -866,6 +872,43 @@ with st.sidebar:
     _exec_provider = _model_provider(st.session_state.get("home_execution_model", _DEFAULT_EXEC_MODEL))
     _is_ollama_exec = _exec_provider == "ollama"
 
+    if _is_ollama_exec:
+        st.checkbox(
+            "Enable VLM (experimental)",
+            key="home_enable_vlm",
+            help="Allow image-aware analysis with compatible Ollama models. Keep off for text-only models.",
+        )
+        _exec_model_name = st.session_state.get("home_execution_model", "")
+        _exec_model_bare = _exec_model_name[len("ollama/"):] if _exec_model_name.startswith("ollama/") else _exec_model_name
+        _exec_model_full = resolve_model_name(_exec_model_bare, _ollama_base, timeout=1.0)
+        _likely_vision_model = any(
+            token in _exec_model_bare.lower()
+            for token in (
+                "vision",
+                "vl",
+                "llava",
+                "bakllava",
+                "minicpm-v",
+                "moondream",
+                "qwen2-vl",
+                "qwen2.5-vl",
+                "qwen2.5vl",
+                "gemma3",
+            )
+        )
+        if st.session_state.get("home_enable_vlm", False):
+            _metadata_has_vision = model_supports_vision(_exec_model_full, _ollama_base, timeout=1.2)
+            if _metadata_has_vision is False:
+                st.warning(
+                    "VLM is enabled, but Ollama metadata suggests this model does not support vision. "
+                    "Use a vision-capable model (for example LLaVA or Qwen-VL)."
+                )
+            elif _metadata_has_vision is None and not _likely_vision_model:
+                st.warning(
+                    "VLM is enabled, but model vision support could not be confirmed from Ollama metadata and the name may be text-only. "
+                    "If image reasoning fails, switch to a known vision model (for example LLaVA or Qwen-VL)."
+                )
+
     # Ollama base URL (shown when any selected model uses Ollama)
     if _is_ollama_exec or _provider == "ollama":
         st.text_input(
@@ -1077,6 +1120,7 @@ context_source: structured_fields
     _interactive_mode = st.session_state.home_interactive_mode
     _intervene_every = st.session_state.home_intervene_every
     _use_deepresearch = st.session_state.home_use_deepresearch
+    _enable_vlm = bool(st.session_state.get("home_enable_vlm", False))
     _model_name = st.session_state.home_model_name
     _execution_model = st.session_state.get("home_execution_model", "claude-sonnet-4-6")
     _h5ad_path = str(FIXED_H5AD_PATH) if DEMO_MODE else st.session_state.get("home_h5ad_path")
@@ -1158,6 +1202,7 @@ context_source: structured_fields
         }
         if _exec_mode == "ollama":
             run_config["ollama_base_url"] = st.session_state.get("home_ollama_base_url", "http://localhost:11434")
+            run_config["enable_vlm"] = _enable_vlm
         (run_output_dir / g._RUN_CONFIG_FILE).write_text(json.dumps(run_config), encoding="utf-8")
         cmd = [
             sys.executable, str(ROOT / "run_cellvoyager.py"),
@@ -1182,7 +1227,10 @@ context_source: structured_fields
             cmd.extend(["--execution-model", _execution_model])
         if _exec_mode == "ollama":
             cmd.extend(["--ollama-base-url", st.session_state.get("home_ollama_base_url", "http://localhost:11434")])
-            cmd.append("--no-vlm")
+            if _enable_vlm:
+                cmd.append("--vlm")
+            else:
+                cmd.append("--no-vlm")
             # Self-critique is auto-disabled for ollama in run_cellvoyager.py
         if _use_deepresearch and _exec_mode != "ollama":
             cmd.append("--deepresearch")
